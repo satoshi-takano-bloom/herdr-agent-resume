@@ -157,6 +157,10 @@ class FlagTests(unittest.TestCase):
         self.assertEqual(ar.launch_flags("codex", argv), [["-m", "gpt-5"], ["-c", "model_reasoning_effort=high"],
                                                           ["-s", "workspace-write"], ["--model=o3"]])
 
+    def test_codex_keeps_running_under_herdr(self):
+        args = ar.flat(ar.launch_flags("codex", ["--no-daemon", "-p", "matt-oc-implementer"]))
+        self.assertEqual(args, ["--no-daemon", "-p", "matt-oc-implementer"])
+
     def test_edge_cases(self):
         self.assertEqual(ar.launch_flags("claude", ["--model"]), [])                     # no value
         self.assertEqual(ar.launch_flags("claude", ["--model", "--verbose"]), [["--verbose"]])

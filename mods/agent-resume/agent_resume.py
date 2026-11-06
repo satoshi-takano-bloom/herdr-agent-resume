@@ -65,7 +65,7 @@ KEEP_FLAGS = {
         "--disallowed-tools": "+", "--mcp-config": "+", "--tools": "+", "--betas": "+",
     },
     "codex": {
-        "--oss": 0, "--search": 0, "--dangerously-bypass-approvals-and-sandbox": 0,
+        "--oss": 0, "--search": 0, "--no-daemon": 0, "--dangerously-bypass-approvals-and-sandbox": 0,
         "--no-alt-screen": 0, "--approve-for-me": 0,
         "-c": 1, "--config": 1, "-m": 1, "--model": 1, "-p": 1, "--profile": 1, "-s": 1, "--sandbox": 1,
         "-a": 1, "--ask-for-approval": 1, "--add-dir": 1, "--enable": 1, "--disable": 1,
