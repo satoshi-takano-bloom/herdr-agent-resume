@@ -1,3 +1,4 @@
+from contextlib import suppress
 import importlib.util
 import json
 import multiprocessing
@@ -228,7 +229,9 @@ class FailureTests(unittest.TestCase):
             with mock.patch.object(ar, "hc_json", return_value=lost_term):
                 self.assertIsNone(ar.after("1", env=env))                 # no claim: `here` didn't start it
                 Path(ar._claim_path("claude", SID)).write_text("999999999 1")
-                self.assertIn("exited right away (code 1)", ar.after("1", env=env))
+                with mock.patch.object(ar, "retry_later") as later:
+                    self.assertIn("exited right away (code 1)", ar.after("1", env=env))
+                later.assert_called_once_with()
                 self.assertFalse(os.path.exists(ar._claim_path("claude", SID)))
                 Path(ar._claim_path("claude", SID)).write_text("999999999 1")
                 old = time.time() - 60
@@ -692,11 +695,7 @@ class OpenCodeTests(unittest.TestCase):
         self.assertEqual(args, ["--auto", "--standalone", "--server", "http://x", "--log-level", "debug", "--print-logs"])
         self.assertEqual(ar.resume_argv(oc_label(args=["--auto"])), ["opencode", "--session", OC_SID, "--auto"])
 
-    def test_a_process_named_opencode_is_the_agent(self):
-        self.assertEqual(ar.find_agent("opencode", 5, lambda pid: {"ppid": 1, "names": ar._names(
-            "/opt/homebrew/Cellar/opencode-v2/2.2.5/bin/opencode")}), 5)
-
-    def test_here_asks_the_service_whether_the_conversation_exists(self):
+    def test_the_decision_follows_the_services_answer(self):
         term = terminal(lbl=oc_label(shell=100))
         self.assertEqual(self.decide(term, lambda s: True)[1], None)
         self.assertEqual(self.decide(term, lambda s: False), (None, "no saved conversation to resume"))
@@ -727,17 +726,6 @@ class OpenCodeTests(unittest.TestCase):
     def test_a_missing_opencode_command_is_not_a_missing_conversation(self):
         with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"PATH": folder}):
             self.assertIsNone(ar.opencode_saved(OC_SID))
-
-    def test_here_waits_for_the_service_to_come_up(self):
-        answers = iter([None, None, True])
-        with mock.patch.object(ar.time, "sleep"):
-            self.assertIs(ar.wait_for_session(OC_SID, check=lambda s: next(answers)), True)
-
-    def test_here_gives_up_on_a_silent_service_and_keeps_the_note(self):
-        clock = iter(range(0, 1000, 10))
-        with mock.patch.object(ar.time, "sleep"), mock.patch.object(ar.time, "monotonic", lambda: next(clock)):
-            self.assertIsNone(ar.wait_for_session(OC_SID, check=lambda s: None))
-
 
 class LaunchFlagReadingTests(unittest.TestCase):
     def test_reads_a_running_programs_exact_words(self):
@@ -777,22 +765,144 @@ class LaunchFlagReadingTests(unittest.TestCase):
         _, skipped = ar.plan([term], BOOT, folder_ok=lambda p: True, session_ok=lambda s: True)
         self.assertEqual(skipped[0]["reason"], ar.UNREAD_FLAGS)
 
-    def test_the_shell_is_told_why_a_resume_did_not_happen(self):
-        for why in (ar.UNREAD_FLAGS, ar.NO_SERVICE):
-            with mock.patch.object(ar, "here", return_value=why), \
+class OpenCodeHereTests(unittest.TestCase):
+    """What a starting shell does, with a stand-in `opencode` answering for the service."""
+    ALIVE = "echo '{}'\n"
+    GONE = "echo '{\"_tag\":\"SessionNotFoundError\"}'\nexit 1\n"
+    SILENT = "exit 1\n"
+
+    def run_here(self, service):
+        with tempfile.TemporaryDirectory() as folder:
+            fake_opencode(folder, service)
+            env = {"HC_TERMINAL_ID": "t1", "PATH": f"{folder}{os.pathsep}{os.environ['PATH']}", "XDG_RUNTIME_DIR": folder}
+            term = terminal(pid=300, lbl=oc_label(shell=100, cwd=folder, args=["--auto"]))
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(ar, "hc_json", return_value=term), \
+                 mock.patch.object(ar, "boot_id", return_value=BOOT), \
+                 mock.patch.object(ar.os, "getppid", return_value=300), \
+                 mock.patch.object(ar, "needs_own_job", return_value=False), \
+                 mock.patch.object(ar, "_default_signals"), \
+                 mock.patch.object(ar.os, "chdir"), \
+                 mock.patch.object(ar.os, "execvp", side_effect=SystemExit) as start, \
+                 mock.patch.object(ar, "retry_later") as later, \
                  mock.patch.object(ar, "log"), \
-                 mock.patch("sys.stderr", new_callable=StringIO) as err:
+                 mock.patch("sys.stderr", new_callable=StringIO) as err, \
+                 suppress(SystemExit):  # exec never returns
                 ar.main(["agent_resume.py", "here"])
-            self.assertIn(why, err.getvalue())
+        return start, later, err.getvalue()
+
+    def test_an_existing_conversation_comes_back_with_its_flags(self):
+        start, later, _ = self.run_here(self.ALIVE)
+        start.assert_called_once_with("opencode", ["opencode", "--session", OC_SID, "--auto"])
+        later.assert_not_called()
+
+    def test_a_deleted_conversation_is_not_created_anew(self):
+        start, later, _ = self.run_here(self.GONE)
+        start.assert_not_called()
+        later.assert_not_called()
+
+    def test_a_silent_service_leaves_the_shell_free_and_tries_again_later(self):
+        start, later, said = self.run_here(self.SILENT)
+        start.assert_not_called()
+        later.assert_called_once_with()
+        self.assertIn(ar.NO_SERVICE, said)
+
+    def test_a_core_that_does_not_answer_is_tried_again_later(self):
+        with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": "t1"}), \
+             mock.patch.object(ar, "hc_json", side_effect=ar.HcError("hc get: no core")), \
+             mock.patch.object(ar, "retry_later") as later, \
+             mock.patch.object(ar, "log"), \
+             mock.patch("sys.stderr", new_callable=StringIO):
+            self.assertEqual(ar.main(["agent_resume.py", "here"]), 0)
+        later.assert_called_once_with()
+
+    def test_unread_flags_are_said_and_not_tried_again(self):
+        term = terminal(pid=300, lbl=oc_label(shell=100, cwd="/", args_unread=True))
+        with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": "t1"}), \
+             mock.patch.object(ar, "hc_json", return_value=term), \
+             mock.patch.object(ar, "boot_id", return_value=BOOT), \
+             mock.patch.object(ar.os, "getppid", return_value=300), \
+             mock.patch.object(ar, "retry_later") as later, \
+             mock.patch.object(ar, "log"), \
+             mock.patch("sys.stderr", new_callable=StringIO) as err:
+            ar.main(["agent_resume.py", "here"])
+        later.assert_not_called()
+        self.assertIn(ar.UNREAD_FLAGS, err.getvalue())
+
+
+class RetryTests(unittest.TestCase):
+    WAITING = {"resumed": [], "skipped": [{"reason": ar.NO_SERVICE}]}
+    DONE = {"resumed": [{"terminal": "t1"}], "skipped": [{"reason": "its folder is gone"}]}
+
+    def retry(self, *passes):
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar.time, "sleep"), \
+             mock.patch.object(ar, "log"), \
+             mock.patch.object(ar, "resume", side_effect=passes) as resume:
+            return ar.retry(), resume.call_count
+
+    def test_stops_once_nothing_is_waiting_any_more(self):
+        self.assertEqual(self.retry(self.WAITING, self.DONE), ("done", 2))
+
+    def test_gives_up_after_a_few_passes(self):
+        passes = [self.WAITING] * len(ar.RETRY_DELAYS)
+        self.assertEqual(self.retry(*passes), ("gave up", len(ar.RETRY_DELAYS)))
+
+    def test_an_agent_that_exited_right_away_is_worth_another_pass(self):
+        failed = {"resumed": [], "skipped": [{"reason": f"{ar.EXITED}: boom"}]}
+        self.assertEqual(self.retry(failed, self.DONE), ("done", 2))
+
+    def test_a_core_that_does_not_answer_is_worth_another_pass(self):
+        self.assertEqual(self.retry(ar.HcError("hc ls: no core"), self.DONE), ("done", 2))
+
+    def test_only_one_retry_runs(self):
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+            held = ar.runtime_lock("retry")
+            self.addCleanup(os.close, held)
+            self.assertEqual(ar.retry(), "already retrying")
+
+    def test_it_runs_outside_the_terminal_that_asked(self):
+        env = {"HC_TERMINAL_ID": "t1", "HC_TERMINAL_SOCKET": "/run/t1", "HC_SCOPE": "t1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(ar.subprocess, "Popen") as popen:
+            ar.retry_later()
+        self.assertEqual(popen.call_args.args[0][-1], "retry")
+        self.assertFalse(env.keys() & popen.call_args.kwargs["env"].keys())
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+
+class WatchTests(unittest.TestCase):
+    """A shutdown ends agents and terminals a moment apart: only a shell that outlives the
+    grace means the person quit."""
+
+    def watch(self, shell_alive):
+        waited = []
+
+        def alive(pid):
+            self.assertEqual(waited, [ar.EXIT_GRACE])  # judged after the grace, not before
+            return shell_alive
+
+        term = terminal(pid=30, lbl=label(pid=40, shell=30))
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar, "wait_exit"), \
+             mock.patch.object(ar.time, "sleep", side_effect=waited.append), \
+             mock.patch.object(ar, "alive", side_effect=alive), \
+             mock.patch.object(ar, "hc_json", return_value=term), \
+             mock.patch.object(ar, "hc") as hc:
+            return ar.watch("t1", 40, 30), hc
+
+    def test_a_shell_gone_during_the_grace_keeps_the_note(self):
+        outcome, hc = self.watch(False)
+        self.assertEqual(outcome, "terminal went with it")
+        hc.assert_not_called()
+
+    def test_a_shell_that_outlives_the_grace_means_the_person_quit(self):
+        outcome, hc = self.watch(True)
+        self.assertEqual(outcome, f"forgot {SID}")
+        hc.assert_called_once_with(["label", "t1", f"{ar.LABEL}="])
 
 
 class ProcessStartTests(unittest.TestCase):
     """A stale claim must not match a new process that got the same pid."""
-
-    def test_ps_reports_when_a_process_started(self):
-        info = ar._proc_ps(os.getpid())
-        self.assertLess(abs(time.time() - info["start"]), 86400 * 30)
-        self.assertIn("python", " ".join(info["names"]).lower())
 
     def test_shell_age(self):
         self.assertLess(ar.shell_age(os.getpid()), 86400 * 30)

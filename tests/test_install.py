@@ -167,8 +167,27 @@ class OtherAgentHookTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cli.json"):
                 installer.opencode_changes(Path(folder), "/app/mods/agent-resume", False)
 
-    def test_the_tui_part_is_installed_with_the_mod(self):
-        self.assertIn("tui.js", installer.FILES)
+    def test_install_and_uninstall_put_the_tui_part_in_place_and_take_it_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            app = home / "app"
+            app.mkdir()
+            (app / "keys.json").write_text("{}")
+            cli = home / ".config/opencode/cli.json"
+            cli.parent.mkdir(parents=True)
+            original = {"plugins": ["./herdr-opencode"]}
+            cli.write_text(json.dumps(original))
+            base = ["install.py", "--home", str(home), "--app-home", str(app), "--no-adopt"]
+            mod = (app / "mods/agent-resume").resolve()
+            with mock.patch.object(installer.subprocess, "run"):
+                with mock.patch("sys.argv", base), redirect_stdout(StringIO()):
+                    installer.main()
+                self.assertTrue((mod / "tui.js").is_file())
+                self.assertEqual(json.loads(cli.read_text())["plugins"], ["./herdr-opencode", str(mod)])
+                with mock.patch("sys.argv", [*base, "--uninstall"]), redirect_stdout(StringIO()):
+                    installer.main()
+            self.assertEqual(json.loads(cli.read_text()), original)
+            self.assertFalse(mod.exists())
 
     def test_only_agents_set_up_on_this_machine(self):
         with tempfile.TemporaryDirectory() as directory:

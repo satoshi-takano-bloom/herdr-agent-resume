@@ -55,6 +55,9 @@ these from inside a Herdr terminal, or `hc` talks to your real core.
   that way so they can be tested without herdr-core.
 - `mods/agent-resume/main.js`: the Ctrl+Shift+R popup.
 - `mods/agent-resume/summary.js`: the toast text, no `herdr` imports.
+- `mods/agent-resume/tui.js`: OpenCode's TUI part. It tells `agent_resume.py`
+  which conversation a terminal shows; OpenCode's server part can't, because
+  one service serves every terminal.
 - `scripts/install.py`: the installer, including the shell startup lines for
   `--auto`. Its `FILES` list must name every file in `mods/agent-resume/`
   (CI checks this).
@@ -78,14 +81,14 @@ Some guidelines:
 - A behavior change comes with a test in `tests/`.
 - The hook must never get in the agent's way: no output, short timeouts,
   every error swallowed into the log. The same goes for `here` and the shell
-  that runs it.
+  that runs it: what needs to wait goes to a detached `retry`.
 - Nothing typed or run may come from unchecked input: session ids match
   `SESSION_RE`, folders match `TYPABLE_PATH_RE` before they're typed.
 - No network requests, and no changes to files outside the app home,
   `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.grok/hooks/agent-resume.json`,
   `~/.gemini/config/hooks.json`, `~/.kiro/hooks/agent-resume.json`,
-  `~/.pi/agent/extensions/herdr-agent-resume.js` and (with `--auto`) the
-  shell startup files, always backed up first.
+  `~/.pi/agent/extensions/herdr-agent-resume.js`, `~/.config/opencode/cli.json`
+  and (with `--auto`) the shell startup files, always backed up first.
 - Update `README.md` and `RECIPE.md` when users would notice the change.
 
 By contributing you agree your work is released under the [MIT License](LICENSE).

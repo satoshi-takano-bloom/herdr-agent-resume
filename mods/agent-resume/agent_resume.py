@@ -16,6 +16,8 @@ This brings agent sessions back, the way the Herdr TUI did:
                       in place of typing anything
   after CODE          run by the same shell when that agent exits with CODE:
                       says so when it didn't come back (exited right away)
+  retry               internal: a few spaced `resume` passes, for what failed
+                      only for now (right after a login)
   launch-kiro <id>    internal: supervise a resumed V3 job before its first hook
   adopt               note Claude Code sessions already running before the hook
                       was installed (from ~/.claude/sessions/<pid>.json)
@@ -124,9 +126,8 @@ EXIT_GRACE = 10.0    # after an agent exits, wait this long before deciding it q
 VERIFY_WAIT = 5.0    # after typing, how long `resume` gives agents before checking they started
 QUICK_EXIT = 10.0    # an agent `here` started that exits sooner than this, with an error, failed
 HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
-SERVICE_TIMEOUT = 30 # one question to OpenCode's service, which may have to start first
-SERVICE_WAIT = 60.0  # how long a starting shell waits for that service before giving up
-SERVICE_POLL = 2.0
+SERVICE_TIMEOUT = 10 # one question to OpenCode's service, which may have to start first
+RETRY_DELAYS = (15, 30, 60)  # seconds before each pass of `retry`
 LOG_LIMIT = 256 * 1024
 
 NOT_STARTED = "shell not started yet"
@@ -767,16 +768,6 @@ def opencode_saved(session):
     return False if "SessionNotFoundError" in r.stdout else None
 
 
-def wait_for_session(session, wait=SERVICE_WAIT, check=opencode_saved):
-    """`check`, again until the service answers or `wait` seconds went by."""
-    deadline = time.monotonic() + wait
-    while True:
-        found = check(session)
-        if found is not None or time.monotonic() >= deadline:
-            return found
-        time.sleep(SERVICE_POLL)
-
-
 def why_not_resumable(label, file_ok, session_ok):
     """Why this session can't be started from what was noted, or None when it can."""
     if label.get("args_unread"):
@@ -1113,6 +1104,39 @@ def launch_kiro(session, env=None):
     return run_kiro(term, label, shell)
 
 
+def worth_retrying(reason):
+    return reason == NO_SERVICE or reason.startswith(EXITED)
+
+
+def retry():
+    """A few `resume` passes, spaced out, for what failed only for now: right after a
+    login the core or OpenCode's service may not answer yet."""
+    lock = runtime_lock("retry")
+    if lock is None:
+        return "already retrying"
+    try:
+        for delay in RETRY_DELAYS:
+            time.sleep(delay)
+            try:
+                out = resume()
+            except HcError as error:
+                log("retry", outcome=str(error))
+                continue
+            if not out.get("busy") and not any(worth_retrying(item["reason"]) for item in out["skipped"]):
+                return "done"
+        return "gave up"
+    finally:
+        os.close(lock)
+
+
+def retry_later():
+    """Start `retry` apart from this terminal, so the shell that asked stays free."""
+    env = {k: v for k, v in os.environ.items() if k not in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE")}
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "retry"], env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     close_fds=True, start_new_session=True)
+
+
 def here(env=None, shell_pid=None):
     """Called by a starting shell. Starts the agent when its terminal lost one and
     returns its exit code; returns why not otherwise."""
@@ -1123,7 +1147,7 @@ def here(env=None, shell_pid=None):
     if env.get("AGENT_RESUME_AUTO") == "0":
         return "turned off"
     terminal = hc_json(["get", term], timeout=HOOK_HC_TIMEOUT)
-    label, why = decide_here(terminal, shell_pid or os.getppid(), boot_id(), session_ok=wait_for_session)
+    label, why = decide_here(terminal, shell_pid or os.getppid(), boot_id())
     if why:
         return why
     if not claim(label["agent"], label["session"]):
@@ -1175,8 +1199,9 @@ def after(code, env=None):
     if ran > QUICK_EXIT:
         return None
     log("failed", terminal=term, agent=label["agent"], session=label["session"], code=code)
+    retry_later()
     return (f"agent-resume: {label['agent']} exited right away (code {code}), so session "
-            f"{label['session']} didn't come back. Ctrl+Shift+R tries again.")
+            f"{label['session']} didn't come back. It will be tried again shortly.")
 
 
 # ---------------------------------------------------------------- CLI
@@ -1227,6 +1252,8 @@ def main(argv):
         if outcome.startswith(("couldn't", "error", "invalid session label:")):
             log("here", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
             sys.stderr.write(f"agent-resume: {outcome}\n")
+        if outcome == NO_SERVICE or outcome.startswith("error"):
+            retry_later()
         return 0
     if command_name == "after":
         try:
@@ -1236,6 +1263,13 @@ def main(argv):
             log("after", terminal=os.environ.get("HC_TERMINAL_ID"), outcome=f"error: {error}")
         if line:
             sys.stderr.write(f"\033[33m{line}\033[0m\n")
+        return 0
+    if command_name == "retry":
+        try:
+            outcome = retry()
+        except Exception as error:
+            outcome = f"error: {error}"
+        log("retry", outcome=outcome)
         return 0
     if command_name in ("resume", "status", "adopt"):
         try:
