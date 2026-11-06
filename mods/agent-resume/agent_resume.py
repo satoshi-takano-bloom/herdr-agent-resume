@@ -133,9 +133,12 @@ LOG_LIMIT = 256 * 1024
 NOT_STARTED = "shell not started yet"
 BY_SHELL = "resumed by its shell"
 EXITED = "exited right away"
+NOT_TYPED = "couldn't type into it"
 NO_CONVERSATION = "no saved conversation to resume"
 NO_SERVICE = "couldn't reach OpenCode's service, so its session wasn't resumed"
 UNREAD_FLAGS = "couldn't read its launch flags, so it wasn't resumed"
+UNTYPABLE_FLAGS = "a launch flag can't be typed safely, so it wasn't resumed"
+RACED = "its shell was starting it at the same moment"
 
 
 class HcError(Exception):
@@ -755,6 +758,11 @@ def command(label):
     return f"cd '{cwd}' && " + " ".join(_quote(a) for a in resume_argv(label, typable_only=True))
 
 
+def drops_flags(label):
+    """True when the typed command would leave a flag out. Kiro's launcher reads them itself."""
+    return label["agent"] != "kiro" and resume_argv(label, typable_only=True) != resume_argv(label)
+
+
 def opencode_saved(session):
     """True or False when OpenCode's service says whether it has this conversation, None
     when it can't be asked. Asking starts the service if needed, and it runs at most once."""
@@ -778,8 +786,10 @@ def why_not_resumable(label, file_ok, session_ok):
     return NO_SERVICE if found is None else None if found else NO_CONVERSATION
 
 
-def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile, session_ok=opencode_saved):
-    """Which terminals to resume. Pure: `terminals` are `hc get` records."""
+def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile, session_ok=opencode_saved,
+         whole_flags=False):
+    """Which terminals to resume. Pure: `terminals` are `hc get` records. `whole_flags`
+    skips a session that typing would bring back without one of its flags."""
     entries, skipped = [], []
     for terminal in terminals:
         if terminal.get("state") != "live":
@@ -811,6 +821,8 @@ def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile, sessi
             reason = "its folder is gone"
         elif typed is None:
             reason = "its folder name can't be typed safely"
+        elif whole_flags and drops_flags(label):
+            reason = UNTYPABLE_FLAGS
         else:
             reason = why_not_resumable(label, file_ok, session_ok)
         if reason:
@@ -865,14 +877,46 @@ def failed_start(address, boot):
     return f"{EXITED}: {said}" if said else EXITED
 
 
-def resume(dry_run=False, wait=START_WAIT):
+def settled(address):
+    """`hc get` of a terminal, once its shell has run long enough to take typing."""
+    terminal = hc_json(["get", address])
+    age = shell_age(terminal["pid"])
+    if age is None or age >= SHELL_SETTLE:
+        return terminal
+    time.sleep(SHELL_SETTLE - age)
+    return hc_json(["get", address])
+
+
+def type_resume(item):
+    """Type one resume command; returns why not, or None once it's typed. The claim stops
+    this terminal's shell from starting the agent as the text goes in: an agent would
+    take the text as a prompt and send it."""
+    terminal = settled(item["terminal"])
+    if not at_shell(terminal):
+        return BY_SHELL if starting_agent(terminal, item["agent"]) else "something else is running there"
+    if not claim(item["agent"], item["session"]):
+        return BY_SHELL
+    if not at_shell(hc_json(["get", item["terminal"]])):
+        return RACED
+    hc(["send", item["terminal"], item["command"]], plain=True)
+    return None
+
+
+def resume(dry_run=False, wait=START_WAIT, whole_flags=False):
     lock = runtime_lock("resume")
     if lock is None:
         return {"busy": True, "resumed": [], "skipped": []}
+    try:
+        return run_pass(dry_run, wait, whole_flags)
+    finally:
+        os.close(lock)
+
+
+def run_pass(dry_run, wait, whole_flags):
     boot = boot_id()
     deadline = time.monotonic() + wait
     while True:
-        todo, skipped = plan(gather(), boot)
+        todo, skipped = plan(gather(), boot, whole_flags=whole_flags)
         if dry_run or time.monotonic() >= deadline or not any(s["reason"] == NOT_STARTED for s in skipped):
             break
         time.sleep(0.5)
@@ -884,19 +928,11 @@ def resume(dry_run=False, wait=START_WAIT):
         if index:
             time.sleep(SEND_GAP)
         try:
-            terminal = hc_json(["get", item["terminal"]])
-            if claim_holder(item["agent"], item["session"]):
-                skipped.append({**item, "reason": BY_SHELL})
-                continue
-            if not at_shell(terminal):
-                skipped.append({**item, "reason": "something else is running there"})
-                continue
-            age = shell_age(terminal["pid"])
-            if age is not None and age < SHELL_SETTLE:
-                time.sleep(SHELL_SETTLE - age)
-            hc(["send", item["terminal"], item["command"]], plain=True)
+            why = type_resume(item)
         except HcError as error:
-            skipped.append({**item, "reason": f"couldn't type into it: {error}"})
+            why = f"{NOT_TYPED}: {error}"
+        if why:
+            skipped.append({**item, "reason": why})
             continue
         resumed.append(item)
         log("resume", terminal=item["terminal"], where=item["where"], agent=item["agent"], session=item["session"])
@@ -907,6 +943,8 @@ def resume(dry_run=False, wait=START_WAIT):
             if why:
                 resumed.remove(item)
                 skipped.append({**item, "reason": why})
+    for item in todo:
+        release(item["agent"], item["session"])
     for item in skipped:
         log("skip", terminal=item["terminal"], agent=item["agent"], session=item["session"], reason=item["reason"])
     return {"resumed": resumed, "skipped": skipped}
@@ -954,6 +992,20 @@ def claim(agent, session):
                 return False
             f.write(stamp)
         return True
+    finally:
+        os.close(lock)
+
+
+def release(agent, session):
+    """Give back a claim this process holds, so that a later pass in it can take the session."""
+    lock = runtime_lock(f"claim-guard-{agent}-{session}")
+    if lock is None:
+        return
+    try:
+        if claim_holder(agent, session) == os.getpid():
+            os.unlink(_claim_path(agent, session))
+    except OSError:
+        pass
     finally:
         os.close(lock)
 
@@ -1105,7 +1157,7 @@ def launch_kiro(session, env=None):
 
 
 def worth_retrying(reason):
-    return reason == NO_SERVICE or reason.startswith(EXITED)
+    return reason in (NO_SERVICE, RACED) or reason.startswith((EXITED, NOT_TYPED))
 
 
 def retry():
@@ -1118,7 +1170,7 @@ def retry():
         for delay in RETRY_DELAYS:
             time.sleep(delay)
             try:
-                out = resume()
+                out = resume(whole_flags=True)
             except HcError as error:
                 log("retry", outcome=str(error))
                 continue
@@ -1132,9 +1184,12 @@ def retry():
 def retry_later():
     """Start `retry` apart from this terminal, so the shell that asked stays free."""
     env = {k: v for k, v in os.environ.items() if k not in ("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE")}
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "retry"], env=env,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True, start_new_session=True)
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "retry"], env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, start_new_session=True)
+    except OSError as error:
+        log("retry", outcome=f"couldn't start: {error}")
 
 
 def here(env=None, shell_pid=None):
