@@ -877,6 +877,22 @@ class RetryTests(unittest.TestCase):
             self.assertEqual(ar.retry(), "done")
         self.assertEqual(len(passes), 2)
 
+    def test_a_shell_that_asked_during_the_last_pass_gets_a_pass_too(self):
+        passes = []
+
+        def one_pass(**_):
+            passes.append(self.WAITING)
+            if len(passes) == len(ar.RETRY_DELAYS):
+                ar.note_asked("t2", os.getpid())
+                return self.WAITING
+            return self.DONE if len(passes) > len(ar.RETRY_DELAYS) else self.WAITING
+
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar.time, "sleep"), mock.patch.object(ar, "log"), \
+             mock.patch.object(ar, "resume", side_effect=one_pass):
+            self.assertEqual(ar.retry(), "done")
+        self.assertEqual(len(passes), len(ar.RETRY_DELAYS) + 1)
+
     def test_only_one_retry_runs(self):
         with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
             held = ar.runtime_lock("retry")
@@ -982,17 +998,28 @@ class PassTests(unittest.TestCase):
         self.run_with(core, ar.retry)
         self.assertEqual(core.sent, [])
 
-    def test_an_old_request_has_run_out_so_nothing_lands_in_what_a_person_types(self):
+    def test_a_slow_service_gets_every_pass_however_long_they_take(self):
+        fake_opencode(self.folder, 'n=$(cat "$0.count" 2>/dev/null || echo 0); echo $((n + 1)) > "$0.count"\n'
+                                   f'[ "$n" -ge {len(ar.RETRY_DELAYS) - 1} ] && echo "{{}}" && exit 0\nexit 1\n')
         core = self.asked(Core(self.lost_label()))
-        long_ago = time.time() - ar.ASK_LIFETIME - 1
-        os.utime(ar._asked_path("t1"), (long_ago, long_ago))
-        self.run_with(core, ar.retry)
-        self.assertEqual(core.sent, [])
+        hours = iter(range(0, 3600 * 100, 3600))
+        with mock.patch.object(ar.time, "time", lambda: next(hours)):
+            self.assertEqual(self.run_with(core, ar.retry), "done")
+        self.assertEqual(len(core.sent), 1)
+
+    def test_a_request_ends_with_the_retry_that_served_it(self):
+        fake_opencode(self.folder, "exit 1\n")
+        core = self.asked(Core(self.lost_label()))
+        self.assertEqual(self.run_with(core, ar.retry), "gave up")
+        fake_opencode(self.folder, "echo '{}'\n")
+        self.assertEqual(self.run_with(core, ar.retry), "done")  # another terminal's retry, later
+        self.assertEqual(core.sent, [])  # a person may be typing at that prompt by now
 
     def test_retry_never_drops_a_flag_to_type_the_command(self):
         core = self.asked(Core(self.lost_label(args=["--log-level", "it's"])))
         self.assertEqual(self.run_with(core, ar.retry), "done")
         self.assertEqual(core.sent, [])
+        self.asked(core)
         out = self.run_with(core, lambda: ar.resume(unattended=True))
         self.assertEqual(out["skipped"][0]["reason"], ar.UNTYPABLE_FLAGS)
 

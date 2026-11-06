@@ -128,7 +128,6 @@ QUICK_EXIT = 10.0    # an agent `here` started that exits sooner than this, with
 HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
 SERVICE_TIMEOUT = 10 # one question to OpenCode's service, which may have to start first
 RETRY_DELAYS = (15, 30, 60)  # seconds before each pass of `retry`
-ASK_LIFETIME = sum(RETRY_DELAYS) + 30  # later, a person may be typing at that prompt
 LOG_LIMIT = 256 * 1024
 
 NOT_STARTED = "shell not started yet"
@@ -1143,10 +1142,9 @@ def note_asked(term, shell_pid):
 def shell_asked(terminal):
     """True when this terminal's shell asked for a retry, which it does past its `here`. It
     never runs `here` again, so what's typed can't land in an agent `here` started."""
-    path = _asked_path(terminal["address"])
     try:
-        with open(path) as f:
-            return time.time() - os.path.getmtime(path) < ASK_LIFETIME and f.read() == _stamp(terminal.get("pid"))
+        with open(_asked_path(terminal["address"])) as f:
+            return f.read() == _stamp(terminal.get("pid"))
     except OSError:
         return False
 
@@ -1160,24 +1158,29 @@ def requests():
 
 def retry():
     """A few `resume` passes, spaced out, for what failed only for now: right after a
-    login the core or OpenCode's service may not answer yet."""
+    login the core or OpenCode's service may not answer yet. Requests end with it: by
+    then a person may be typing at those prompts."""
     lock = runtime_lock("retry")
     if lock is None:
         return "already retrying"
+    delays = list(RETRY_DELAYS)
     try:
-        for delay in RETRY_DELAYS:
-            time.sleep(delay)
+        while delays:
+            time.sleep(delays.pop(0))
             before = requests()
             try:
                 out = resume(unattended=True)
             except HcError as error:
                 log("retry", outcome=str(error))
                 continue
-            waiting = out.get("busy") or any(worth_retrying(item["reason"]) for item in out["skipped"])
-            if not waiting and requests() == before:  # a retry started during the pass stopped at the lock
+            if requests() != before:  # that shell's own retry stopped at the lock
+                delays = list(RETRY_DELAYS)
+            elif not out.get("busy") and not any(worth_retrying(item["reason"]) for item in out["skipped"]):
                 return "done"
         return "gave up"
     finally:
+        for name in requests():
+            os.unlink(os.path.join(runtime_dir(), name))
         os.close(lock)
 
 
