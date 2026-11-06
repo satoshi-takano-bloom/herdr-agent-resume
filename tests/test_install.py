@@ -128,6 +128,48 @@ class OtherAgentHookTests(unittest.TestCase):
             installer.apply_shell(removed)
             self.assertFalse(path.exists())
 
+    def test_opencode_plugin_is_listed_beside_the_other_plugins_and_removed(self):
+        mod = "/app/mods/agent-resume"
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            self.assertEqual(installer.opencode_changes(home, mod, False), [])  # OpenCode isn't set up here
+            config = home / ".config" / "opencode"
+            config.mkdir(parents=True)
+            cli = config / "cli.json"
+            original = {"session": {"sidebar": "hide"}, "plugins": ["./herdr-opencode", {"package": "/x", "options": {"a": 1}}]}
+            cli.write_text(json.dumps(original))
+            [(path, text)] = installer.opencode_changes(home, mod, False)
+            self.assertEqual(path, cli)
+            self.assertEqual(json.loads(text)["plugins"], [*original["plugins"], mod])
+            self.assertEqual(json.loads(text)["session"], original["session"])
+            cli.write_text(text)
+            self.assertEqual(installer.opencode_changes(home, mod, False), [])  # a repeat changes nothing
+            moved = installer.opencode_changes(home, "/elsewhere/mods/agent-resume", False)
+            self.assertEqual(json.loads(moved[0][1])["plugins"], [*original["plugins"], "/elsewhere/mods/agent-resume"])
+            [(_, text)] = installer.opencode_changes(home, mod, True)
+            self.assertEqual(json.loads(text), original)
+
+    def test_opencode_without_a_cli_file_gets_one_and_loses_it_again(self):
+        mod = "/app/mods/agent-resume"
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / ".config" / "opencode").mkdir(parents=True)
+            [(path, text)] = installer.opencode_changes(home, mod, False)
+            self.assertEqual(json.loads(text), {"plugins": [mod]})
+            path.write_text(text)
+            self.assertEqual(installer.opencode_changes(home, mod, True), [(path, None)])
+
+    def test_a_cli_file_that_is_not_plain_json_stops_the_install(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / ".config" / "opencode"
+            config.mkdir(parents=True)
+            (config / "cli.json").write_text("// comment\n{}")
+            with self.assertRaisesRegex(ValueError, "cli.json"):
+                installer.opencode_changes(Path(folder), "/app/mods/agent-resume", False)
+
+    def test_the_tui_part_is_installed_with_the_mod(self):
+        self.assertIn("tui.js", installer.FILES)
+
     def test_only_agents_set_up_on_this_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

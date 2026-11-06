@@ -7,7 +7,8 @@
   Claude Code (~/.claude/settings.json), Codex (~/.codex/hooks.json),
   Grok (~/.grok/hooks/agent-resume.json), Antigravity (~/.gemini/config/hooks.json),
   Kiro V3 (~/.kiro/hooks/agent-resume.json).
-  Pi gets an extension in ~/.pi/agent/extensions/;
+  Pi gets an extension in ~/.pi/agent/extensions/; OpenCode gets the mod's TUI part
+  listed in ~/.config/opencode/cli.json;
 - notes Claude Code sessions that are already running (`agent_resume.py adopt`);
 - with `--auto`, adds a few lines to fish, bash and zsh's startup files so a restored
   terminal starts its agent again by itself (`--no-auto` takes them out).
@@ -29,7 +30,7 @@ MOD_NAME = "agent-resume"
 PACKAGE = "herdr-agent-resume"
 VERSION = "0.4.1"
 MARKER = ".agent-resume-install.json"
-FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py")
+FILES = ("main.js", "summary.js", "mod.json", "agent_resume.py", "tui.js")
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json", "__pycache__"}
 HOOK_TAG = "agent_resume.py' hook "
 BEGIN, END = "# >>> agent-resume >>>", "# <<< agent-resume <<<"
@@ -359,6 +360,39 @@ def pi_changes(home, script, remove):
     return [(path, text)]
 
 
+def is_our_plugin(entry):
+    return isinstance(entry, str) and entry.endswith(f"/mods/{MOD_NAME}")
+
+
+def opencode_changes(home, mod, remove):
+    """(path, new text or None to delete) for OpenCode's cli.json, when OpenCode is set up here.
+    The mod folder itself is the plugin: its tui.js is the TUI part. Listing it here keeps the
+    plugin out of OpenCode's config folder, where a new file would reload every running OpenCode."""
+    folder = home / ".config" / "opencode"
+    if not folder.is_dir():
+        return []
+    path = folder / "cli.json"
+    try:
+        config = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError as error:
+        raise ValueError(f"{path} is not plain JSON: {error}. No files changed.") from error
+    if not isinstance(config, dict) or not isinstance(config.get("plugins", []), list):
+        raise ValueError(f"{path} has no list of plugins. No files changed.")
+    plugins = config.get("plugins", [])
+    kept = [entry for entry in plugins if not is_our_plugin(entry)]
+    if remove and len(kept) == len(plugins):
+        return []
+    wanted = kept if remove else [*kept, str(mod)]
+    if wanted == plugins:
+        return []
+    merged = {**config, "plugins": wanted}
+    if not wanted:
+        del merged["plugins"]
+    if remove and not merged:
+        return [(path, None)]
+    return [(path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n")]
+
+
 def agent_configs(home):
     """(name, path, existing config, kind) for each agent that is set up on this machine.
 
@@ -407,7 +441,7 @@ def main():
         raise ValueError("--auto and --no-auto can't go together")
     mode = "remove" if args.uninstall or args.no_auto else "add" if args.auto else "refresh"
     shells = shell_changes(home, script, mode)
-    pi = pi_changes(home, script, args.uninstall)
+    plugins = pi_changes(home, script, args.uninstall) + opencode_changes(home, destination, args.uninstall)
 
     if args.uninstall:
         keys = remove_keys(json.loads(keys_path.read_text()), snippet)
@@ -426,8 +460,8 @@ def main():
     print(f"Mod: {destination}\nShortcut: Ctrl+Shift+R")
     for path, _ in changes:
         print(f"Hook: {path}")
-    for path, text in pi:
-        print(f"{'Pi extension removed' if text is None else 'Pi extension'}: {path}")
+    for path, text in plugins:
+        print(f"{'Plugin removed' if text is None else 'Plugin'}: {path}")
     for path, text in shells:
         print(f"{'Startup lines removed' if text is None or BEGIN not in text else 'Startup lines'}: {path}")
     hooked = {name for name, _, _, _ in configs}
@@ -442,9 +476,9 @@ def main():
     for name, path, _, _ in configs:
         if path.exists():
             shutil.copy2(path, backup / f"{name}-{path.name}")
-    for path, _ in pi:
+    for path, _ in plugins:
         if path.exists():
-            shutil.copy2(path, backup / f"pi-{path.name}")
+            shutil.copy2(path, backup / f"plugin-{path.name}")
     for path, _ in shells:
         if path.exists():
             shutil.copy2(path, backup / f"shell-{path.name.lstrip('.')}")
@@ -455,7 +489,7 @@ def main():
         for path, config in changes:
             write_hook(path, config)
         atomic_json(keys_path, keys)
-        apply_shell(pi)
+        apply_shell(plugins)
         apply_shell(shells)
         if destination.exists():
             shutil.rmtree(destination)
@@ -480,7 +514,7 @@ def main():
         atomic_json(keys_path, keys)
         for path, config in changes:
             write_hook(path, config)
-        apply_shell(pi)
+        apply_shell(plugins)
         apply_shell(shells)
     except Exception:
         if replaced and destination.exists():
@@ -494,8 +528,8 @@ def main():
                 shutil.copy2(saved, path)
             elif path.name == "agent-resume.json":
                 path.unlink(missing_ok=True)
-        for path, _ in pi:
-            saved = backup / f"pi-{path.name}"
+        for path, _ in plugins:
+            saved = backup / f"plugin-{path.name}"
             if saved.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(saved, path)

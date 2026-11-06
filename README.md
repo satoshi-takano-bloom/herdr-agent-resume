@@ -6,6 +6,7 @@
 [![Antigravity CLI](https://img.shields.io/badge/Antigravity_CLI-4285F4?style=flat-square)](#install)
 [![Pi CLI](https://img.shields.io/badge/Pi_CLI-475569?style=flat-square)](#install)
 [![Kiro CLI V3](https://img.shields.io/badge/Kiro_CLI_V3-7C3AED?style=flat-square)](#install)
+[![OpenCode](https://img.shields.io/badge/OpenCode-211E1E?style=flat-square)](#install)
 
 **Bring coding-agent sessions back after a reboot, in the [Herdr](https://herdr.dev) desktop app.**
 
@@ -21,6 +22,7 @@ This mod brings that back. Press **Ctrl+Shift+R** after a restart, and each term
 | Antigravity CLI (`agy`) | `cd '<folder>' && agy --conversation <session> [flags]` |
 | Pi | `cd '<folder>' && pi --session <session> [flags]` |
 | Kiro CLI V3 | `cd '<folder>' && python3 <mod>/agent_resume.py launch-kiro <session>` (starts `kiro-cli chat --v3 --resume-id <session> [flags]`) |
+| OpenCode V2 | `cd '<folder>' && opencode --session <session> [flags]` |
 
 The agents open idle on their old conversation, with the flags they were started with (`--model`, `--dangerously-skip-permissions`, `-s workspace-write`, ...); nothing runs until you type. A toast says what came back, and which ones didn't, with the agent's own error when one exits right away.
 
@@ -51,12 +53,14 @@ The installer:
   - Antigravity CLI: `SessionStart` and `PreInvocation` under the name `agent-resume` in `~/.gemini/config/hooks.json`
   - Kiro CLI V3: global `SessionStart` and `UserPromptSubmit` hooks in `~/.kiro/hooks/agent-resume.json`. These work with the built-in agent and custom profiles. Install, update and uninstall leave agent profiles and `chat.defaultAgent` untouched.
   - Pi: `~/.pi/agent/extensions/herdr-agent-resume.js` (Pi has no shell hook; the extension reports the session)
+  - OpenCode V2: the mod folder is listed under `plugins` in `~/.config/opencode/cli.json`. Its `tui.js` runs inside each OpenCode TUI and reports the conversation that terminal shows. A plugin in OpenCode's server can't do this: one service serves every terminal.
 - notes the Claude Code sessions already running in Herdr, so they're covered right away.
 
 Then:
 - **Codex** asks you to review the new hook the next time it starts ("Hooks need review"): trust it, or Codex sessions won't be noted.
 - **Grok** runs your hooks after you trust the folder. Until then, Grok sessions aren't noted.
 - Codex sessions already running are noted the next time they start or resume. The same is true for Grok, Antigravity, Pi and Kiro: the hook notes them the next time that session starts.
+- A running OpenCode TUI picks the plugin up by itself and notes the conversation it shows.
 
 Update with `--update`, remove everything with `--uninstall`. `--dry-run` shows what would change.
 
@@ -81,7 +85,7 @@ No layout change is needed. Linux and macOS, Python 3.8+ (standard library only)
 
 Three small pieces, all in `mods/agent-resume/agent_resume.py`:
 
-1. **A session hook** (`hook claude|codex|grok|agy|pi|kiro`). Every time an agent starts a session in a Herdr terminal, it writes the session on that terminal as an `agent-resume` label in herdr-core: agent, session id, folder, transcript, launch flags, the agent's process and the terminal's shell process, and the boot. Labels live with the terminal and survive a reboot. Claude Code runs it on start, `/resume`, `/clear` and compact. The others run it on their own session-start event (see [Watch out](#watch-out)).
+1. **A session hook** (`hook claude|codex|grok|agy|pi|kiro|opencode`). Every time an agent starts a session in a Herdr terminal, it writes the session on that terminal as an `agent-resume` label in herdr-core: agent, session id, folder, transcript, launch flags, the agent's process and the terminal's shell process, and the boot. Labels live with the terminal and survive a reboot. Claude Code runs it on start, `/resume`, `/clear` and compact. The others run it on their own session-start event (see [Watch out](#watch-out)).
 2. **A watcher** (`watch`, started by the hook, one per agent process). It sleeps until the agent exits. If the terminal's shell is still the same process afterwards, you quit the agent yourself, so it removes the label: a session you quit stays quit. If the shell went with it (reboot, logout, core restart, pane closed), the label stays.
 3. **The resume pass** (`resume`, what Ctrl+Shift+R runs; with `--auto`, each restored shell runs `here` for itself instead). A terminal needs its agent back when its label is from another boot, or its shell is a different process than the one the agent ran under. Then, if it sits at an idle shell, the pass types the resume command into it (`hc send`), 150 ms apart. It waits up to 12 s for restored shells that haven't started yet, and 5 s after typing, it checks each agent is up: a terminal back at its shell with no session noted failed, and the toast quotes the last line the agent printed.
 
@@ -107,11 +111,13 @@ It also never notes:
 - A folder Claude Code hasn't been told to trust stops at its trust prompt. Folders you worked in are trusted already.
 - `claude --resume` may continue under a new session id. The hook follows it, since every start is noted.
 - **Which flags come back.** Only flags that set up how the agent runs and that its resume command accepts. Claude Code keeps `--model`, `--permission-mode`, `--dangerously-skip-permissions`, `--add-dir` and a few more. Codex keeps `-m`, `-c`, `-s`, `-a`, `--search` and a few more, but not `--full-auto` (`codex resume` doesn't take it). Grok keeps `--model`, `--permission-mode`, `--always-approve`, `--add-dir` and a few more, but not `-c` / `--continue` or `--worktree`. Antigravity keeps `--model`, `--effort`, `--mode`, `--dangerously-skip-permissions`, `--add-dir` and a few more. Pi keeps `--model`, `--thinking`, `--provider`, `--session-dir`, `--tools` and a few more. Kiro V3 keeps `--mode`, `--model`, `--effort`, `--agent`, `--trust-all-tools` and `--trust-tools`. Never a prompt, a session picker (`--resume`, `--continue`, `--session`, `--conversation`, `--resume-id`), `-p` / `--print`, or `--worktree`. The full list is `KEEP_FLAGS` in `agent_resume.py`. With Ctrl+Shift+R, a flag whose value has a quote or a backslash is left out, since it can't be typed safely; `--auto` keeps it. Flags are read from `/proc`, so on macOS they don't come back yet.
-- Supported agents: Claude Code, Codex, Grok, Antigravity CLI (`agy`), Pi and Kiro CLI. Shells: fish, bash, zsh, sh, dash, ksh (`--auto`: fish, bash, zsh).
+- Supported agents: Claude Code, Codex, Grok, Antigravity CLI (`agy`), Pi, Kiro CLI and OpenCode V2. Shells: fish, bash, zsh, sh, dash, ksh (`--auto`: fish, bash, zsh).
 - Codex notes a session at its first message, not when it opens.
 - Grok notes a session on `SessionStart`, including one reopened with `--resume`. A subagent's own session is not noted. Your hooks don't run until the folder is trusted.
 - Antigravity notes a new conversation on `SessionStart` (before the first model call) and notes again on `PreInvocation`, so a resumed conversation is picked up on its next turn. A resumed `agy` you quit before that turn is still lost, and the next pass brings it back.
 - Pi has no shell hooks. The extension notes a resumed session at startup, and a new session once its file exists (after the first message). Opening Pi and quitting before you type leaves nothing to resume.
+- OpenCode keeps conversations in a database behind its service, so there is no transcript file to check: the mod asks the service (`opencode api`), which starts it if needed. A starting shell waits up to a minute for an answer, and leaves the session noted when there is none. OpenCode creates a conversation at the first message, so a TUI you never typed in has nothing to bring back.
+- A resumed session must run as it ran before. When an agent's launch flags can't be read, the session is noted as such and isn't resumed: the reason shows in `status`. Linux reads them from `/proc`, macOS from the kernel (`KERN_PROCARGS2`).
 - Kiro support requires the V3 engine: start it with `kiro-cli chat --v3`. Global `SessionStart` and `UserPromptSubmit` hooks note conversations after the first prompt without a custom agent. V3 defers these hooks even when reopening saved history, so both resume paths supervise the Kiro job, refresh its label and forget it on exit without requiring another prompt. A quick startup error keeps the old label for retry. Resume always includes `--v3`, and uses `~/.kiro/sessions/<workspace-hash>/<session>/session.json` to check that the session exists (a new session may not have a message log yet). V2 sessions and legacy V2 labels are ignored; switching engines and migrating conversations are outside this mod. The hook prints nothing because Kiro adds stdout to context.
 - Like the Herdr TUI's resume, this relies on how each agent CLI resumes today. If a CLI changes its flags or its hook input, it can break.
 

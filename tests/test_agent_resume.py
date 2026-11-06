@@ -4,6 +4,8 @@ import multiprocessing
 import os
 from io import StringIO
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -534,7 +536,7 @@ class HookTests(unittest.TestCase):
         with mock.patch.object(ar, "hook", return_value="saved"), \
              mock.patch.object(ar, "log"), \
              mock.patch("sys.stdin", StringIO("{}")):
-            for agent, expected in (("claude", ""), ("agy", "{}\n"), ("pi", "saved\n")):
+            for agent, expected in (("claude", ""), ("agy", "{}\n"), ("pi", "saved\n"), ("opencode", "saved\n")):
                 with mock.patch("sys.stdout", new_callable=StringIO) as out:
                     self.assertEqual(ar.main(["agent_resume.py", "hook", agent]), 0)
                 self.assertEqual(out.getvalue(), expected, agent)
@@ -631,6 +633,172 @@ class KiroLifecycleTests(unittest.TestCase):
             self.assertEqual(ar.run_kiro("t7", saved, 30), 0)
         self.assertEqual(remember.call_args.kwargs, {"watcher": False, "launch_args": ["--mode", "spec"]})
         self.assertEqual(finish.call_args.args[:5], ("t7", saved, 30, 40, 0))
+
+
+OC_SID = "ses_e6499f92fffeXxp4nswJpod8Fm"
+
+
+def oc_label(**extra):
+    saved = label(agent="opencode", session=OC_SID)
+    saved["transcript"] = None
+    return {**saved, **extra}
+
+
+def fake_opencode(folder, script):
+    path = Path(folder) / "opencode"
+    path.write_text("#!/bin/sh\n" + script)
+    path.chmod(0o755)
+
+
+class OpenCodeTests(unittest.TestCase):
+    ENV = {"HC_TERMINAL_ID": "t7"}
+
+    def decide(self, term, session_ok):
+        return ar.decide_here(term, 300, BOOT, folder_ok=lambda p: True, session_ok=session_ok)
+
+    def test_a_label_needs_no_transcript_because_the_conversation_is_in_a_database(self):
+        self.assertEqual(ar.read_label({ar.LABEL: json.dumps(oc_label())})["session"], OC_SID)
+        self.assertIsNone(ar.read_label({ar.LABEL: json.dumps(label(session=OC_SID) | {"transcript": None})}))
+
+    def test_hook_notes_the_session_without_a_transcript(self):
+        raw = json.dumps({"session_id": OC_SID, "cwd": "/work"})
+        with mock.patch.object(ar, "find_agent", return_value=40), \
+             mock.patch.object(ar, "hc_json", return_value={"state": "live", "pid": 30}), \
+             mock.patch.object(ar, "placement", return_value="direct"), \
+             mock.patch.object(ar, "remember") as remember:
+            self.assertEqual(ar.hook("opencode", raw, env=self.ENV), "saved")
+        remember.assert_called_once_with("t7", "opencode", OC_SID, "/work", None, 40, 30)
+
+    def test_switching_conversations_replaces_the_note(self):
+        noted = {"state": "live", "pid": 30, "labels": {ar.LABEL: json.dumps(oc_label(pid=40, shell=30))}}
+        with mock.patch.object(ar, "find_agent", return_value=40), \
+             mock.patch.object(ar, "hc_json", return_value=noted), \
+             mock.patch.object(ar, "placement", return_value="direct"), \
+             mock.patch.object(ar, "remember") as remember:
+            same = json.dumps({"session_id": OC_SID, "cwd": "/work"})
+            self.assertEqual(ar.hook("opencode", same, env=self.ENV), "already noted")
+            other = json.dumps({"session_id": "ses_other000000000000", "cwd": "/work"})
+            self.assertEqual(ar.hook("opencode", other, env=self.ENV), "saved")
+        self.assertEqual(remember.call_args.args[2], "ses_other000000000000")
+
+    def test_resume_command_keeps_launch_conditions_only(self):
+        args = ar.flat(ar.launch_flags("opencode", [
+            "--auto", "--standalone", "--server", "http://x", "--log-level", "debug", "--print-logs",
+            "--prompt", "do work", "-c", "--continue", "-s", "ses_old000000000", "/some/folder"]))
+        self.assertEqual(args, ["--auto", "--standalone", "--server", "http://x", "--log-level", "debug", "--print-logs"])
+        self.assertEqual(ar.resume_argv(oc_label(args=["--auto"])), ["opencode", "--session", OC_SID, "--auto"])
+
+    def test_a_process_named_opencode_is_the_agent(self):
+        self.assertEqual(ar.find_agent("opencode", 5, lambda pid: {"ppid": 1, "names": ar._names(
+            "/opt/homebrew/Cellar/opencode-v2/2.2.5/bin/opencode")}), 5)
+
+    def test_here_asks_the_service_whether_the_conversation_exists(self):
+        term = terminal(lbl=oc_label(shell=100))
+        self.assertEqual(self.decide(term, lambda s: True)[1], None)
+        self.assertEqual(self.decide(term, lambda s: False), (None, "no saved conversation to resume"))
+        self.assertEqual(self.decide(term, lambda s: None), (None, ar.NO_SERVICE))
+
+    def test_status_reports_a_missing_conversation_and_a_silent_service(self):
+        term = terminal(fg_name="zsh", lbl=oc_label(shell=100))
+        for answer, reason in ((False, "no saved conversation to resume"), (None, ar.NO_SERVICE)):
+            todo, skipped = ar.plan([term], BOOT, folder_ok=lambda p: True, session_ok=lambda s: answer)
+            self.assertEqual(todo, [])
+            self.assertEqual(skipped[0]["reason"], reason)
+        todo, _ = ar.plan([term], BOOT, folder_ok=lambda p: True, session_ok=lambda s: True)
+        self.assertEqual(todo[0]["command"], f"cd '/work' && opencode --session {OC_SID}")
+
+    def test_reading_the_service(self):
+        cases = (
+            ("echo '{\"id\":\"x\"}'\n", True),
+            ("echo '{\"_tag\":\"SessionNotFoundError\"}'\necho 'HTTP 404 Not Found' >&2\nexit 1\n", False),
+            ("echo 'Error: Server process exited with code 1' >&2\nexit 1\n", None),
+            ("echo 'HTTP 500 Internal Server Error' >&2\nexit 1\n", None),
+        )
+        for script, answer in cases:
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as folder:
+                fake_opencode(folder, script)
+                with mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
+                    self.assertIs(ar.opencode_saved(OC_SID), answer)
+
+    def test_a_missing_opencode_command_is_not_a_missing_conversation(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"PATH": folder}):
+            self.assertIsNone(ar.opencode_saved(OC_SID))
+
+    def test_here_waits_for_the_service_to_come_up(self):
+        answers = iter([None, None, True])
+        with mock.patch.object(ar.time, "sleep"):
+            self.assertIs(ar.wait_for_session(OC_SID, check=lambda s: next(answers)), True)
+
+    def test_here_gives_up_on_a_silent_service_and_keeps_the_note(self):
+        clock = iter(range(0, 1000, 10))
+        with mock.patch.object(ar.time, "sleep"), mock.patch.object(ar.time, "monotonic", lambda: next(clock)):
+            self.assertIsNone(ar.wait_for_session(OC_SID, check=lambda s: None))
+
+
+class LaunchFlagReadingTests(unittest.TestCase):
+    def test_reads_a_running_programs_exact_words(self):
+        words = [sys.executable, "-c", "import time; time.sleep(30)", "--setting-sources", "", "two words"]
+        child = subprocess.Popen(words)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        for _ in range(100):  # exec has happened once the words are the program's own
+            argv = ar.proc_argv(child.pid)
+            if argv and argv[1:] == words[1:]:
+                break
+            time.sleep(0.02)
+        self.assertEqual(argv[1:], words[1:])
+
+    def test_a_process_that_is_gone_has_no_words(self):
+        child = subprocess.Popen([sys.executable, "-c", ""])
+        child.wait()
+        self.assertIsNone(ar.proc_argv(child.pid))
+
+    def remember(self, argv):
+        with mock.patch.object(ar, "proc_argv", return_value=argv), \
+             mock.patch.object(ar, "hc") as hc, \
+             mock.patch.object(ar, "boot_id", return_value=BOOT):
+            ar.remember("t7", "opencode", OC_SID, "/work", None, 40, 30, watcher=False)
+        return json.loads(hc.call_args.args[0][2].split("=", 1)[1])
+
+    def test_flags_that_could_not_be_read_are_marked(self):
+        self.assertEqual(self.remember(["opencode", "--auto", "--prompt", "x"])["args"], ["--auto"])
+        saved = self.remember(None)
+        self.assertTrue(saved["args_unread"])
+        self.assertNotIn("args", saved)
+
+    def test_unread_flags_stop_the_resume_instead_of_widening_or_changing_what_runs(self):
+        term = terminal(fg_name="zsh", lbl=oc_label(shell=100, args_unread=True))
+        found, why = ar.decide_here(term, 300, BOOT, folder_ok=lambda p: True, session_ok=lambda s: True)
+        self.assertEqual((found, why), (None, ar.UNREAD_FLAGS))
+        _, skipped = ar.plan([term], BOOT, folder_ok=lambda p: True, session_ok=lambda s: True)
+        self.assertEqual(skipped[0]["reason"], ar.UNREAD_FLAGS)
+
+    def test_the_shell_is_told_why_a_resume_did_not_happen(self):
+        for why in (ar.UNREAD_FLAGS, ar.NO_SERVICE):
+            with mock.patch.object(ar, "here", return_value=why), \
+                 mock.patch.object(ar, "log"), \
+                 mock.patch("sys.stderr", new_callable=StringIO) as err:
+                ar.main(["agent_resume.py", "here"])
+            self.assertIn(why, err.getvalue())
+
+
+class ProcessStartTests(unittest.TestCase):
+    """A stale claim must not match a new process that got the same pid."""
+
+    def test_ps_reports_when_a_process_started(self):
+        info = ar._proc_ps(os.getpid())
+        self.assertLess(abs(time.time() - info["start"]), 86400 * 30)
+        self.assertIn("python", " ".join(info["names"]).lower())
+
+    def test_shell_age(self):
+        self.assertLess(ar.shell_age(os.getpid()), 86400 * 30)
+
+    def test_a_claim_from_a_process_that_had_this_pid_before_is_stale(self):
+        with tempfile.TemporaryDirectory() as runtime, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+            self.assertTrue(ar.claim("opencode", OC_SID))
+            self.assertEqual(ar.claim_holder("opencode", OC_SID), os.getpid())
+            Path(ar._claim_path("opencode", OC_SID)).write_text(f"{os.getpid()} 1")
+            self.assertIsNone(ar.claim_holder("opencode", OC_SID))
 
 
 class ClaudeRegistryTests(unittest.TestCase):

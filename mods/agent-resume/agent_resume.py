@@ -6,7 +6,8 @@ restart) back as a shell in its last folder, but never runs the program again.
 This brings agent sessions back, the way the Herdr TUI did:
 
   hook <agent>        note the session on its terminal (an `agent-resume` label
-                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro
+                      kept by herdr-core). Agents: claude, codex, grok, agy, pi, kiro,
+                      opencode
   resume              type that agent's resume command into each terminal that
                       lost its agent and sits at a shell
   status              what `resume` would do, without typing anything
@@ -44,6 +45,9 @@ AGENTS = {
     "pi": {"names": {"pi"}, "argv": lambda session: ["pi", "--session", session]},
     "kiro": {"names": {"kiro", "kiro-cli", "kiro-cli-chat"},
              "argv": lambda session: ["kiro-cli", "chat", "--v3", "--resume-id", session]},
+    # OpenCode keeps conversations in a database behind its service, not in a transcript file.
+    "opencode": {"names": {"opencode"}, "argv": lambda session: ["opencode", "--session", session],
+                 "no_transcript": True},
 }
 # Launch flags carried over to the resume command, with how many values each takes
 # ("+": one or more, up to the next flag). Only flags that set up how the agent runs
@@ -97,6 +101,10 @@ KEEP_FLAGS = {
         "--trust-all-tools": 0, "-a": 0,
         "--agent": 1, "--model": 1, "--effort": 1, "--trust-tools": 1, "--mode": 1,
     },
+    "opencode": {
+        "--auto": 0, "--standalone": 0, "--print-logs": 0,
+        "--server": 1, "--log-level": 1,
+    },
 }
 MAX_ARGS = 64
 MAX_ARG_LEN = 1024
@@ -111,15 +119,22 @@ TYPABLE_ARG_RE = re.compile(r"^[^'\\\x00-\x1f\x7f]*$")
 SEND_GAP = 0.15      # seconds between two terminals, like the Herdr TUI's spacing
 SHELL_SETTLE = 1.5   # a restored shell runs this long before anything is typed into it
 START_WAIT = 12.0    # how long `resume` waits for restored shells that haven't started yet
-EXIT_GRACE = 2.0     # after an agent exits, wait this long before deciding it quit by itself
+EXIT_GRACE = 10.0    # after an agent exits, wait this long before deciding it quit by itself:
+                     # a shutdown ends the watcher too, if the terminal outlives the agent a moment
 VERIFY_WAIT = 5.0    # after typing, how long `resume` gives agents before checking they started
 QUICK_EXIT = 10.0    # an agent `here` started that exits sooner than this, with an error, failed
 HOOK_HC_TIMEOUT = 3  # the agent waits for its hook: never hold it up long
+SERVICE_TIMEOUT = 30 # one question to OpenCode's service, which may have to start first
+SERVICE_WAIT = 60.0  # how long a starting shell waits for that service before giving up
+SERVICE_POLL = 2.0
 LOG_LIMIT = 256 * 1024
 
 NOT_STARTED = "shell not started yet"
 BY_SHELL = "resumed by its shell"
 EXITED = "exited right away"
+NO_CONVERSATION = "no saved conversation to resume"
+NO_SERVICE = "couldn't reach OpenCode's service, so its session wasn't resumed"
+UNREAD_FLAGS = "couldn't read its launch flags, so it wasn't resumed"
 
 
 class HcError(Exception):
@@ -148,14 +163,19 @@ def _proc_linux(pid):
 
 def _proc_ps(pid):
     try:
-        out = subprocess.run(["ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "ppid=", "-o", "lstart=", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5,
+                             env={**os.environ, "LC_ALL": "C"}).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    parts = out.split(None, 1)
-    if len(parts) != 2 or not parts[0].isdigit():
+    parts = out.split(None, 6)  # ppid, then lstart's five words ("Fri Nov  6 15:38:18 2026"), then comm
+    if len(parts) != 7 or not parts[0].isdigit():
         return None
-    return {"ppid": int(parts[0]), "names": _names(parts[1]), "start": None}
+    try:
+        start = int(time.mktime(time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, OverflowError):
+        start = None
+    return {"ppid": int(parts[0]), "names": _names(parts[6]), "start": start}
 
 
 def _names(*raw):
@@ -239,6 +259,8 @@ def shell_age(pid):
     info = proc(pid)
     if not info or info.get("start") is None:
         return None
+    if not os.path.isdir("/proc/self"):
+        return time.time() - info["start"]  # `ps` already gave seconds since the epoch
     try:
         with open("/proc/stat") as f:
             btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
@@ -283,14 +305,34 @@ def boot_id():
     return None
 
 
+def _proc_argv_darwin(pid):
+    """macOS has no /proc and `ps` joins the words with spaces: ask the kernel, whose
+    KERN_PROCARGS2 answer is argc, the executable's path, padding, then each argument."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(query, 3, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    answer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(query, 3, answer, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = answer.raw[:size.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    start = raw.find(b"\0", 4)
+    while 0 <= start < len(raw) and raw[start] == 0:
+        start += 1
+    words = raw[start:].split(b"\0")[:argc] if start > 0 else []
+    return [a.decode("utf-8", "replace") for a in words] if len(words) == argc else None
+
+
 def proc_argv(pid):
-    """A process's argv, or None where it can't be read exactly (only Linux has
-    /proc/<pid>/cmdline; `ps` joins the words with spaces)."""
+    """A process's argv, or None where it can't be read exactly."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             raw = f.read()
     except OSError:
-        return None
+        return _proc_argv_darwin(pid) if sys.platform == "darwin" else None
     return [a.decode("utf-8", "replace") for a in raw.split(b"\0")[:-1]] or None
 
 
@@ -392,6 +434,8 @@ def parse_label(labels):
         return None, None  # Legacy V2 labels must not silently migrate a conversation.
     for field in ("cwd", "transcript"):
         path = value.get(field)
+        if field == "transcript" and path is None and AGENTS[agent].get("no_transcript"):
+            continue
         if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
             return None, f"invalid session label: {field} must be an absolute path"
     for field in ("pid", "shell"):
@@ -549,7 +593,7 @@ def hook(agent, raw, env=None):
         transcript = os.path.expanduser(transcript)
     if not transcript:
         transcript = default_transcript(agent, session, cwd)
-    if not isinstance(transcript, str) or not transcript:
+    if not AGENTS[agent].get("no_transcript") and (not isinstance(transcript, str) or not transcript):
         return "no transcript: the session can't be resumed"
 
     agent_pid = find_agent(agent, os.getppid())
@@ -576,12 +620,15 @@ def hook(agent, raw, env=None):
 
 
 def remember(term, agent, session, cwd, transcript, agent_pid, shell, watcher=True, launch_args=None):
-    """Label the terminal with the session (and the agent's launch flags) and start its watcher."""
+    """Label the terminal with the session (and the agent's launch flags) and start its watcher.
+    Flags that can't be read are marked: resuming without them could change what the agent may do."""
     label = {"agent": agent, "session": session, "cwd": cwd, "transcript": transcript,
              "pid": agent_pid, "shell": shell, "boot": boot_id(), "at": int(time.time() * 1000)}
     argv = proc_argv(agent_pid) if launch_args is None else None
     if launch_args is not None or argv:
         label["args"] = flat(launch_flags(agent, launch_args if launch_args is not None else argv[1:]))
+    else:
+        label["args_unread"] = True
     hc(["label", term, f"{LABEL}={json.dumps(label, separators=(',', ':'), ensure_ascii=False)}"], timeout=HOOK_HC_TIMEOUT)
     if watcher:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", term, str(agent_pid), str(shell)],
@@ -707,7 +754,40 @@ def command(label):
     return f"cd '{cwd}' && " + " ".join(_quote(a) for a in resume_argv(label, typable_only=True))
 
 
-def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
+def opencode_saved(session):
+    """True or False when OpenCode's service says whether it has this conversation, None
+    when it can't be asked. Asking starts the service if needed, and it runs at most once."""
+    try:
+        r = subprocess.run(["opencode", "api", "get", f"/api/session/{session}"],
+                           capture_output=True, text=True, timeout=SERVICE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 0:
+        return True
+    return False if "SessionNotFoundError" in r.stdout else None
+
+
+def wait_for_session(session, wait=SERVICE_WAIT, check=opencode_saved):
+    """`check`, again until the service answers or `wait` seconds went by."""
+    deadline = time.monotonic() + wait
+    while True:
+        found = check(session)
+        if found is not None or time.monotonic() >= deadline:
+            return found
+        time.sleep(SERVICE_POLL)
+
+
+def why_not_resumable(label, file_ok, session_ok):
+    """Why this session can't be started from what was noted, or None when it can."""
+    if label.get("args_unread"):
+        return UNREAD_FLAGS
+    if not AGENTS[label["agent"]].get("no_transcript"):
+        return None if file_ok(label.get("transcript")) else NO_CONVERSATION
+    found = session_ok(label["session"])
+    return NO_SERVICE if found is None else None if found else NO_CONVERSATION
+
+
+def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile, session_ok=opencode_saved):
     """Which terminals to resume. Pure: `terminals` are `hc get` records."""
     entries, skipped = [], []
     for terminal in terminals:
@@ -738,12 +818,10 @@ def plan(terminals, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
             reason = BY_SHELL if starting_agent(terminal, label["agent"]) else "something else is running there"
         elif not folder_ok(label.get("cwd")):
             reason = "its folder is gone"
-        elif not file_ok(label.get("transcript")):
-            reason = "no saved conversation to resume"
         elif typed is None:
             reason = "its folder name can't be typed safely"
         else:
-            reason = None
+            reason = why_not_resumable(label, file_ok, session_ok)
         if reason:
             skipped.append({**item, "reason": reason})
         else:
@@ -889,7 +967,8 @@ def claim(agent, session):
         os.close(lock)
 
 
-def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile):
+def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.path.isfile,
+                session_ok=opencode_saved):
     """(label, None) when this shell should bring its terminal's agent back, else
     (None, why not). Pure, like `plan`."""
     if terminal.get("state") != "live" or terminal.get("pid") != shell_pid:
@@ -903,9 +982,8 @@ def decide_here(terminal, shell_pid, boot, folder_ok=os.path.isdir, file_ok=os.p
         return None, "agent not lost"
     if not folder_ok(label.get("cwd")):
         return None, "its folder is gone"
-    if not file_ok(label.get("transcript")):
-        return None, "no saved conversation to resume"
-    return label, None
+    why = why_not_resumable(label, file_ok, session_ok)
+    return (None, why) if why else (label, None)
 
 
 def _exit_code(status):
@@ -1045,7 +1123,7 @@ def here(env=None, shell_pid=None):
     if env.get("AGENT_RESUME_AUTO") == "0":
         return "turned off"
     terminal = hc_json(["get", term], timeout=HOOK_HC_TIMEOUT)
-    label, why = decide_here(terminal, shell_pid or os.getppid(), boot_id())
+    label, why = decide_here(terminal, shell_pid or os.getppid(), boot_id(), session_ok=wait_for_session)
     if why:
         return why
     if not claim(label["agent"], label["session"]):
@@ -1122,11 +1200,12 @@ def main(argv):
                 outcome = f"error: {error}"
             if outcome != "not in a Herdr terminal":
                 log("hook", agent=agent, terminal=os.environ.get("HC_TERMINAL_ID"), outcome=outcome)
-        # Antigravity reads stdout as JSON. Pi's extension reads this one line and
-        # shows it to nobody. Every other agent would treat stdout as context, so stay quiet.
+        # Antigravity reads stdout as JSON. Pi's extension and OpenCode's TUI part read this
+        # one line and show it to nobody. Every other agent would treat stdout as context,
+        # so stay quiet.
         if agent == "agy":
             sys.stdout.write("{}\n")
-        elif agent == "pi":
+        elif agent in ("pi", "opencode"):
             sys.stdout.write(outcome + "\n")
         return 0
     if command_name == "watch":
