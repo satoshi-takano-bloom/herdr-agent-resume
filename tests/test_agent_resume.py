@@ -856,7 +856,8 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(self.retry(ar.HcError("hc ls: no core"), self.DONE), ("done", 2))
 
     def test_a_retry_that_cannot_start_stays_out_of_the_shells_way(self):
-        with mock.patch.object(ar.subprocess, "Popen", side_effect=OSError("no python")), \
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar.subprocess, "Popen", side_effect=OSError("no python")), \
              mock.patch.object(ar, "log") as log:
             ar.retry_later()
         self.assertIn("no python", log.call_args.kwargs["outcome"])
@@ -869,18 +870,28 @@ class RetryTests(unittest.TestCase):
 
     def test_it_runs_outside_the_terminal_that_asked(self):
         env = {"HC_TERMINAL_ID": "t1", "HC_TERMINAL_SOCKET": "/run/t1", "HC_SCOPE": "t1"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(ar.subprocess, "Popen") as popen:
+        started = []
+        real = ar.subprocess.Popen
+
+        def popen(argv, *args, **options):  # `ps` still has to run, to tell shells apart
+            if argv[-1] != "retry":
+                return real(argv, *args, **options)
+            started.append(options)
+
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {**env, "XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar.subprocess, "Popen", side_effect=popen):
             ar.retry_later()
-        self.assertEqual(popen.call_args.args[0][-1], "retry")
-        self.assertFalse(env.keys() & popen.call_args.kwargs["env"].keys())
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertTrue(ar.shell_asked({"address": "t1", "pid": os.getppid()}))
+        self.assertFalse(env.keys() & started[0]["env"].keys())
+        self.assertTrue(started[0]["start_new_session"])
 
 
 class Core:
     """A stand-in for herdr-core with one terminal that lost its agent. Typing starts the agent."""
 
     def __init__(self, lbl, not_up=0, on_send=lambda: None):
-        self.term = terminal(fg_name="zsh", pid=300, lbl=lbl)
+        self.shell = os.getpid()  # a live process, as a real shell would be
+        self.term = terminal(fg_name="zsh", pid=self.shell, lbl=lbl)
         self.not_up = not_up
         self.on_send = on_send
         self.sent = []
@@ -897,7 +908,8 @@ class Core:
         if args[0] == "send":
             self.sent.append(args[2])
             self.on_send()
-            self.term = terminal(pid=300, fg_pid=400, fg_name="opencode", lbl=oc_label(shell=300, pid=400))
+            self.term = terminal(pid=self.shell, fg_pid=400, fg_name="opencode",
+                                 lbl=oc_label(shell=self.shell, pid=400))
         return ""
 
 
@@ -920,79 +932,58 @@ class PassTests(unittest.TestCase):
     def lost_label(self, **extra):
         return oc_label(shell=100, cwd=self.folder, **extra)
 
-    def run_with(self, core, action, sleep=None, age=100):
+    def asked(self, core):
+        ar.note_asked("t1", core.shell)
+        return core
+
+    def run_with(self, core, action):
         with mock.patch.object(ar, "hc_json", side_effect=core.json), \
              mock.patch.object(ar, "hc", side_effect=core.run), \
-             mock.patch.object(ar, "shell_age", return_value=age), \
-             mock.patch.object(ar.time, "sleep", side_effect=sleep):
+             mock.patch.object(ar, "shell_age", return_value=100), \
+             mock.patch.object(ar.time, "sleep"):
             return action()
 
     def test_retry_gets_a_second_pass_when_the_service_was_silent(self):
         fake_opencode(self.folder, self.FIRST_SILENT)
-        core = Core(self.lost_label(args=["--auto"]))
+        core = self.asked(Core(self.lost_label(args=["--auto"])))
         self.assertEqual(self.run_with(core, ar.retry), "done")
         self.assertEqual(core.sent, [f"cd '{self.folder}' && opencode --session {OC_SID} --auto"])
 
     def test_retry_gets_a_second_pass_when_the_core_was_not_up(self):
-        core = Core(self.lost_label(), not_up=1)
+        core = self.asked(Core(self.lost_label(), not_up=1))
         self.assertEqual(self.run_with(core, ar.retry), "done")
         self.assertEqual(len(core.sent), 1)
 
-    def test_the_shell_started_the_agent_while_the_pass_waited(self):
+    def test_retry_types_nothing_into_a_shell_that_may_still_start_the_agent_itself(self):
         core = Core(self.lost_label())
-
-        def shell_got_there(_):
-            core.term = terminal(pid=300, fg_pid=400, fg_name="opencode", lbl=self.lost_label())
-
-        out = self.run_with(core, ar.resume, sleep=shell_got_there, age=1.0)
-        self.assertEqual(core.sent, [])
-        self.assertEqual(out["skipped"][0]["reason"], ar.BY_SHELL)
-
-    def test_a_shell_that_claimed_the_session_first_keeps_it(self):
-        core = Core(self.lost_label())
-
-        def shell_claimed(_):
-            Path(ar._claim_path("opencode", OC_SID)).write_text(ar._stamp(os.getppid()))
-
-        out = self.run_with(core, ar.resume, sleep=shell_claimed, age=1.0)
-        self.assertEqual(core.sent, [])
-        self.assertEqual(out["skipped"][0]["reason"], ar.BY_SHELL)
-
-    def test_a_shell_cannot_take_the_session_while_it_is_typed_and_a_later_pass_can(self):
-        taken = []
-        core = Core(self.lost_label(), on_send=lambda: taken.append(ar.claim("opencode", OC_SID)))
-        self.run_with(core, ar.resume)
-        self.assertEqual(taken, [False])
-        self.assertIsNone(ar.claim_holder("opencode", OC_SID))
-
-    def test_a_shell_that_got_there_during_the_claim_is_tried_again(self):
-        core = Core(self.lost_label())
-        real_claim = ar.claim
-
-        def claim(agent, session):
-            core.term = terminal(pid=300, fg_pid=400, fg_name="python3", lbl=self.lost_label())
-            core.term["foreground"]["argv"] = ["python3", "/m/agent_resume.py", "here"]
-            return real_claim(agent, session)
-
-        with mock.patch.object(ar, "claim", side_effect=claim):
-            out = self.run_with(core, ar.resume)
-        self.assertEqual(core.sent, [])
-        self.assertEqual(out["skipped"][0]["reason"], ar.RACED)
-        self.assertTrue(ar.worth_retrying(ar.RACED))
-        self.assertIsNone(ar.claim_holder("opencode", OC_SID))
-
-    def test_retry_never_drops_a_flag_to_type_the_command(self):
-        lbl = self.lost_label(args=["--log-level", "it's"])
-        core = Core(lbl)
         self.assertEqual(self.run_with(core, ar.retry), "done")
         self.assertEqual(core.sent, [])
-        out = self.run_with(core, lambda: ar.resume(whole_flags=True))
+        out = self.run_with(core, lambda: ar.resume(unattended=True))
+        self.assertEqual(out["skipped"][0]["reason"], ar.NOT_ASKED)
+
+    def test_a_shell_that_asked_before_the_restart_is_not_this_shell(self):
+        core = Core(self.lost_label())
+        ar.note_asked("t1", os.getppid())
+        self.run_with(core, ar.retry)
+        self.assertEqual(core.sent, [])
+
+    def test_retry_never_drops_a_flag_to_type_the_command(self):
+        core = self.asked(Core(self.lost_label(args=["--log-level", "it's"])))
+        self.assertEqual(self.run_with(core, ar.retry), "done")
+        self.assertEqual(core.sent, [])
+        out = self.run_with(core, lambda: ar.resume(unattended=True))
         self.assertEqual(out["skipped"][0]["reason"], ar.UNTYPABLE_FLAGS)
 
     def test_a_person_pressing_the_key_still_gets_the_session_without_that_flag(self):
         core = Core(self.lost_label(args=["--log-level", "it's"]))
         self.run_with(core, ar.resume)
         self.assertEqual(core.sent, [f"cd '{self.folder}' && opencode --session {OC_SID}"])
+
+    def test_a_pass_leaves_the_claim_to_the_agent_it_starts(self):
+        held = []  # Kiro's launcher claims the session itself once the typed command runs
+        core = self.asked(Core(self.lost_label(), on_send=lambda: held.append(ar.claim_holder("opencode", OC_SID))))
+        self.run_with(core, ar.retry)
+        self.assertEqual(held, [None])
 
 
 class WatchTests(unittest.TestCase):
