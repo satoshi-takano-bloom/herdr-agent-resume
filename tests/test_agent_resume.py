@@ -862,6 +862,21 @@ class RetryTests(unittest.TestCase):
             ar.retry_later()
         self.assertIn("no python", log.call_args.kwargs["outcome"])
 
+    def test_a_shell_that_asked_during_a_pass_gets_a_pass_too(self):
+        passes = []
+
+        def one_pass(**_):
+            if not passes:
+                ar.note_asked("t2", os.getpid())
+            passes.append(self.DONE)
+            return self.DONE
+
+        with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}), \
+             mock.patch.object(ar.time, "sleep"), mock.patch.object(ar, "log"), \
+             mock.patch.object(ar, "resume", side_effect=one_pass):
+            self.assertEqual(ar.retry(), "done")
+        self.assertEqual(len(passes), 2)
+
     def test_only_one_retry_runs(self):
         with tempfile.TemporaryDirectory() as run, mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
             held = ar.runtime_lock("retry")
@@ -964,6 +979,13 @@ class PassTests(unittest.TestCase):
     def test_a_shell_that_asked_before_the_restart_is_not_this_shell(self):
         core = Core(self.lost_label())
         ar.note_asked("t1", os.getppid())
+        self.run_with(core, ar.retry)
+        self.assertEqual(core.sent, [])
+
+    def test_an_old_request_has_run_out_so_nothing_lands_in_what_a_person_types(self):
+        core = self.asked(Core(self.lost_label()))
+        long_ago = time.time() - ar.ASK_LIFETIME - 1
+        os.utime(ar._asked_path("t1"), (long_ago, long_ago))
         self.run_with(core, ar.retry)
         self.assertEqual(core.sent, [])
 
